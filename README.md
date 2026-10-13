@@ -14,7 +14,8 @@ the Qwen Team / Alibaba Cloud or Apple. Almost everything that makes it work was
 
 Ternary Bonsai 2 27B, each engine alone on the same machine, the same prompts, median of 3 runs, 256 generated tokens,
 greedy. Energy is whole-machine power from `macmon`. Details: [overlay/docs/M6_BONSAI_ORNITH.md](overlay/docs/M6_BONSAI_ORNITH.md)
-and [overlay/docs/results/m6-gpu-compare](overlay/docs/results/m6-gpu-compare).
+and [overlay/docs/results/m6-gpu-compare](overlay/docs/results/m6-gpu-compare). A second 16 GB M6 mini gave the same
+ANE and GPU numbers within 2 tok/s: [overlay/docs/results/second-mini](overlay/docs/results/second-mini).
 
 | Engine | Prefill, 2,048 tok (tok/s) | Decode, prose (tok/s) | Decode, code (tok/s) | J per generated token (code) | Watts during decode |
 |---|---|---|---|---|---|
