@@ -43,8 +43,10 @@ if [ "${NO_VENV:-0}" != 1 ]; then
     if command -v uv >/dev/null; then uv venv -q -p 3.11 .venv
     else "$PYTHON" -m venv .venv; fi
   fi
-  if command -v uv >/dev/null; then uv pip install -q -p .venv/bin/python -r requirements-inference.txt
-  else .venv/bin/pip install -q -r requirements-inference.txt; fi
+  # scikit-learn: Forge's quantization tests (and the GPTQ vector formats) import it lazily; it is not in
+  # requirements-inference.txt, so a fresh tree fails tests/test_quantization.py without it.
+  if command -v uv >/dev/null; then uv pip install -q -p .venv/bin/python -r requirements-inference.txt scikit-learn
+  else .venv/bin/pip install -q -r requirements-inference.txt scikit-learn; fi
   echo "prepare: Python environment in $FORGE_DIR/.venv"
 fi
 [ -f coreai/swift_bridge/libcoreai_bridge.dylib ] || \
