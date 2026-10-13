@@ -25,6 +25,8 @@ and [overlay/docs/results/m6-gpu-compare](overlay/docs/results/m6-gpu-compare).
 
 In Grok Build sessions (tool calls, file edits), decode is about 55 tok/s, with 64% of draft tokens accepted.
 
+Demo: [demo/asteroids.html](demo/asteroids.html), an Asteroids game that the model wrote on the M6 through Grok Build.
+
 Quality (WikiText-2 perplexity, tokens 1,024 to 2,048): Prism pack 6.843, ANE build 6.860. Each layer of the ANE build
 is within 1.3% of a PyTorch / MLX reference, with 100% top-1 agreement on 64 tokens
 ([overlay/docs/results/m6-parity](overlay/docs/results/m6-parity)).
