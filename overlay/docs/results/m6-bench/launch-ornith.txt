@@ -1,0 +1,8 @@
+=== ornith launch 1: .venv/bin/python forge.py serve --runtime coreai --plain --model <models>/forge-ornith15/model --build <models>/forge-ornith15/coreai --ctx 8192 --host <host> --port 8765
+health: {'status': 'ok', 'soc_class': 'm6', 'soc_generation': 18, 'ane_bonded_compile_mode': 2, 'context': 8192, 'kv_cache_dtype': 'v8'}
+answer: 'The capital of France is Paris.'
+answer: '391'
+=== ornith launch 2: .venv/bin/python forge.py serve --runtime coreai --plain --model <models>/forge-ornith15/model --build <models>/forge-ornith15/coreai --ctx 8192 --host <host> --port 8765
+health: {'status': 'ok', 'soc_class': 'm6', 'soc_generation': 18, 'ane_bonded_compile_mode': 2, 'context': 8192, 'kv_cache_dtype': 'v8'}
+answer: 'The capital of France is Paris.'
+answer: '391'

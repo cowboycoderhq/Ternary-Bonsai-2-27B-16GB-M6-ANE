@@ -1,0 +1,15 @@
+# Add to ~/.grok/config.toml. feedback = false removes the one tool whose description contains the session path, so
+# the system prompt is the same in each session and the server's pinned prefix cache can reuse it.
+[features]
+feedback = false
+
+[model.bonsai-ane]
+model = "qwen38-27b-ane"
+base_url = "http://127.0.0.1:8765/v1"
+name = "Ternary Bonsai 2 27B (ANE)"
+api_key = "local-no-auth"
+api_backend = "chat_completions"
+temperature = 0.0
+context_window = 32768
+max_completion_tokens = 8192
+inference_idle_timeout_secs = 1800

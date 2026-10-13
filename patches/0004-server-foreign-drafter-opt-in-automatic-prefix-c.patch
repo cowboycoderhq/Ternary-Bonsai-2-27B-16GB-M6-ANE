@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cowboy Coder <howdy@cowboycoderhq.com>
+Date: Tue, 13 Oct 2026 02:42:14 +0000
+Subject: [PATCH] Server: foreign drafter opt-in, automatic prefix cache, agent
+ fixes
+
+- FORGE_FOREIGN_DRAFTER=1 skips only the export-name pairing check, so the
+  published DFlash2 drafter can draft for Bonsai (taps / T / shapes still checked).
+- Automatic prefix cache: snapshots carry their own KV rows (segments past their
+  parent prefix) in an LRU RAM tier (--prefix-cache-mb) with an SSD tier
+  (--prefix-cache-disk-gb). System prompts are recorded and prefilled at startup
+  as pinned entries (--pin-max). /health reports the cache.
+- A tool call cut off at max_tokens is dropped and replaced with a note, instead
+  of reaching the client as invalid JSON.
+- When the last --repeat-call-guard turns made the same tool call and each one
+  failed, the server adds a note and samples that turn at temperature 0.7.
+---
+ scripts/hf_release.py          |   3 +-
+ scripts/qwen38_coreai_model.py |  50 +++++-
+ scripts/qwen38_server.py       | 301 +++++++++++++++++++++++++++++++--
+ tests/test_drafter_release.py  |  17 ++
+ 4 files changed, 352 insertions(+), 19 deletions(-)
+
+diff --git a/scripts/hf_release.py b/scripts/hf_release.py
+index cc77ec5f12795194c26da5aa266676d8b9ce1325..d38be2556ae08f4db0297a2af8ae1da0b9ff1d3c 100644
+--- a/scripts/hf_release.py
++++ b/scripts/hf_release.py
+@@ -358,7 +358,8 @@ def check_drafter_pair(pkg, directory, target, config):
+     target_id = Path(target.get("export", "")).name
+     draft_target = Path(meta.get("target_export", "")).name
+     head_id = Path(meta.get("head_export", "")).parent.name
+-    if not target_id or draft_target != target_id or head_id != target_id:
++    foreign = os.environ.get("FORGE_FOREIGN_DRAFTER") == "1"  # a drafter with its own head on another target
++    if not foreign and (not target_id or draft_target != target_id or head_id != target_id):
+         raise ValueError("DFlash2 target/head export mismatch; use the drafter built with this target's head")
+     rank = dc.get("selector_rank")
+     if type(rank) is not int or rank != 256:
+diff --git a/scripts/qwen38_coreai_model.py b/scripts/qwen38_coreai_model.py
+index 1e41343650759346a0fe636807163bb72bd5226d..e877c9e4fa21ec241306c0827a8bfc1a378807d4 100644
+--- a/scripts/qwen38_coreai_model.py
++++ b/scripts/qwen38_coreai_model.py
+@@ -378,16 +378,50 @@ class CoreAIQwen:
+         if shrink and self.ctx != self.ladder[0]:
+             self.resize(self.ladder[0])      # hi = rows kept
+ 
+-    def snapshot(self):
++    def snapshot(self, kv=False, parent=None):
+         """DeltaNet buffers + position / pending count; the KV cache is masked by position (not copied), so a snapshot
+-        stays valid while rows [0, pos) are in the cache (restorable)."""
+-        return {"pos": self.pos, "pending": self.pending, "ctx": self.ctx,
++        stays valid while rows [0, pos) are in the cache (restorable). kv=True also copies KV rows, which makes the
++        snapshot independent of the live cache (automatic prefix cache entries): rows [parent pos, pos) when a parent
++        KV snapshot (a prefix of this one) holds the rows before it, else [0, pos)."""
++        snap = {"pos": self.pos, "pending": self.pending, "ctx": self.ctx,
+                 "states": [{n: w.copy() for n, w in ch["curw"].items()} for ch in self.chunks]}
++        if kv:
++            start = parent["pos"] if parent is not None else 0
++            snap["kv"], snap["kv_start"], snap["parent"] = self.kv_rows(self.pos, start), start, parent
++        return snap
+ 
+     def restorable(self, snap) -> bool:
+-        """False when a context shrink dropped KV rows the snapshot needs (restore would raise)."""
++        """False when a context shrink dropped KV rows the snapshot needs (restore would raise). A snapshot that carries
++        its own KV rows (snapshot(kv=True)) is always restorable while it fits the largest context."""
++        if "kv" in snap or "disk" in snap:  # carries its KV rows (in RAM or on the prefix cache's SSD tier)
++            return snap["pos"] <= self.cap(self.ladder[-1])
+         return snap["pos"] <= min(self.hi, self.cap(self.ctx))
+ 
++    def _kv_transposed(self, name):
++        """k{j} with keys_t is (nkv, hd, L); scales ks / vs are (nkv, L); everything else (nkv, L, hd)."""
++        return name[0] == "k" and name[1:].isdigit() and self.keys_t
++
++    def kv_rows(self, n: int, start: int = 0):
++        """Copies of KV rows [start, n) of every attention layer (the automatic prefix cache stores them with a
++        snapshot, so the prefix survives later requests that overwrite those rows; nested prefixes store only the
++        rows past their parent)."""
++        out = []
++        for d in self.kv:
++            row = {}
++            for name, (_, w) in d.items():
++                row[name] = (w[:, :, start:n] if self._kv_transposed(name) else w[:, start:n]).copy()
++            out.append(row)
++        return out
++
++    def _put_kv_rows(self, rows, n: int, start: int = 0):
++        for d, saved in zip(self.kv, rows):
++            for name, v in saved.items():
++                w = d[name][1]
++                if self._kv_transposed(name):
++                    w[:, :, start:n] = v
++                else:
++                    w[:, start:n] = v
++
+     def restore(self, snap):
+         """Back to a snapshot; shrinks to the smallest context entry that holds its position (e.g. a new conversation
+         restoring the shared system-prompt snapshot after a long one). Raises ValueError if not restorable()."""
+@@ -399,8 +433,14 @@ class CoreAIQwen:
+                 ch["curw"][n][:] = v
+         self.pos, self.pending = snap["pos"], snap["pending"]
+         tgt = next(s for s in self.ladder if self.cap(s) >= self.pos)
+-        if tgt < self.ctx:
++        if tgt != self.ctx and ("kv" in snap or tgt < self.ctx):
+             self.resize(tgt)
++        if "kv" in snap:
++            e = snap
++            while e is not None:  # the chain of KV segments back to position 0
++                self._put_kv_rows(e["kv"], e["pos"], e["kv_start"])
++                e = e["parent"]
++            self.hi = self.pos
+ 
+     def resize(self, ctx: int):
+         """Switch every chunk to the entry points of another context length (all loaded): new KV buffers, rows [0, hi)
+diff --git a/scripts/qwen38_server.py b/scripts/qwen38_server.py
+index 0931096858266841781e1c40f1f70e346cc91b3f..386c626f3e9457d426b39ecb285a5c863df27931 100644
+--- a/scripts/qwen38_server.py
++++ b/scripts/qwen38_server.py
+@@ -27,6 +27,10 @@ from pathlib import Path
+ import numpy as np
+ 
+ MODEL_ID = "qwen38-27b-ane"
++# Automatic prefix cache: message starts (from the first) that get a KV-carrying snapshot. Agent clients put the
++# shared, per-workspace context (system prompt + tools, rules, skills) in the first messages; later ones are the
++# conversation, which the in-place "turn" snapshot already covers.
++APC_BOUNDARIES = int(os.environ.get("APC_BOUNDARIES", "5"))
+ # The drafter's ANE call stalls (300-700 ms, a few per 100 cycles, the next verify too) when it is submitted
+ # within ~2 ms of the target verify's return: greedy leaves ~1.5 ms of host work there, sampling ~6 ms. A 3 ms
+ # minimum gap removes the stalls (M6, Core AI target + drafter, 16K greedy, 4 runs each: 10 drafter + 4 verify
+@@ -82,6 +86,27 @@ def parse(argv=None):
+                    "Off by default: code repeats legitimately (0.8 turned 'for (let x = 0; x' into 'for (let x = 0; <')")
+     p.add_argument("--dry-base", type=float, default=1.75)
+     p.add_argument("--dry-allowed", type=int, default=8, help="repeated run length (tokens) tolerated before DRY acts")
++    p.add_argument("--prefix-cache-mb", type=int, default=int(os.environ.get("PREFIX_CACHE_MB", "1536")),
++                   help="automatic prefix cache: host RAM for snapshots that carry their own KV rows, so a new "
++                        "conversation reuses the longest cached prefix even after other requests overwrote the "
++                        "cache (LRU; 0 = the old two in-place snapshots only)")
++    p.add_argument("--prefix-cache-dir", default=os.environ.get("PREFIX_CACHE_DIR",
++                   str(Path.home() / "Library/Caches/forge-prefix-cache")),
++                   help="SSD tier of the prefix cache: entries evicted from RAM are written here and read back on a "
++                        "hit (cleared at startup)")
++    p.add_argument("--prefix-cache-disk-gb", type=float, default=float(os.environ.get("PREFIX_CACHE_DISK_GB", "16")),
++                   help="SSD tier budget (0 = RAM tier only)")
++    p.add_argument("--pin-dir", default=os.environ.get("PREFIX_PIN_DIR",
++                   str(Path.home() / "Library/Application Support/forge-prefix-pins")),
++                   help="system prompts (system message + tools) seen by the server are recorded here; at startup "
++                        "each recorded prefix is prefilled into the prefix cache and pinned (never evicted), so an "
++                        "agent client's first request skips its system prompt")
++    p.add_argument("--pin-max", type=int, default=int(os.environ.get("PREFIX_PIN_MAX", "3")),
++                   help="most recent distinct system prompts to keep pinned (0 = off)")
++    p.add_argument("--repeat-call-guard", type=int, default=int(os.environ.get("REPEAT_CALL_GUARD", "3")),
++                   help="when the last N assistant turns made the identical tool call and each one failed, add a "
++                        "system note telling the model that repeating it will fail again, and sample this turn "
++                        "(temperature 0.7) so a greedy model can leave the loop (0 = off)")
+     p.add_argument("--loop-guard", type=int, default=6, help="stop when the output tail repeats this many times with "
+                    "the same period (0 = off)")
+     modes = p.add_mutually_exclusive_group()
+@@ -259,6 +284,14 @@ class Engine:
+             self.gdn_states.append([s for j, l in enumerate(range(lo, hi + 1))
+                                     if cfg["layer_types"][l] == "linear_attention" for s in (f"conv{j}", f"rec{j}")])
+         self.fed, self.snaps = [], {}   # snapshots: "system" (before the first user turn), "turn" (before the last header)
++        self.apc, self.apc_budget = [], max(0, a.prefix_cache_mb) * 2**20  # automatic prefix cache (LRU, KV included)
++        self.apc_disk_budget = int(max(0.0, a.prefix_cache_disk_gb) * 2**30) if self.apc_budget else 0
++        self.pins = self._pin_load() if getattr(a, "pin_max", 0) > 0 else []
++        self.apc_dir = Path(a.prefix_cache_dir)
++        if self.apc_disk_budget:
++            import shutil
++            shutil.rmtree(self.apc_dir, ignore_errors=True)
++            self.apc_dir.mkdir(parents=True, exist_ok=True)
+         self.user_hdr = self.tok.encode("<|im_start|>user", add_special_tokens=False)
+         self.lock = threading.Lock()
+         print(f"[{MODEL_ID}] loaded {'batched prefill' if self.v2 else f'{len(names)} chunks'} + head"
+@@ -300,30 +333,184 @@ class Engine:
+     # ---- state / prompt cache ----
+     def _snapshot(self, key, ids):
+         if self.v2:
+-            self.snaps[key] = {"ids": list(ids), **self.model.snapshot()}
++            # prefix-cache entries (system prompt, the first message boundaries) copy their KV rows; the per-request
++            # "turn" snapshot stays in place (masked KV), so its cost does not grow with the conversation
++            apc = self.apc_budget > 0 and hasattr(self.model, "kv_rows") and key != "turn"
++            if apc:  # KV rows past the longest cached prefix of this one (its parent) only
++                parent = max((e for e in self.apc if len(e["ids"]) < len(ids) and ids[:len(e["ids"])] == e["ids"]),
++                             key=lambda e: len(e["ids"]), default=None)
++                snap = {"ids": list(ids), **self.model.snapshot(kv=True, parent=parent)}
++            else:
++                snap = {"ids": list(ids), **self.model.snapshot()}
+             if self.drafter is not None:  # the drafter's context ring: which slot holds which position, and the queue
+-                self.snaps[key]["draft"] = (self.drafter.slot_pos.copy(), list(self.drafter.pending))
++                d = self.drafter
++                snap["draft"] = (d.slot_pos.copy(), list(d.pending))
++                if apc:
++                    snap["ring"] = [(k.copy(), v.copy()) for k, v in d.ring]
++            if apc:
++                self._apc_put(snap)
++                if key == "system":
++                    self._pin_record(ids)
++                    snap["pinned"] = any(p == list(ids) for p in self.pins)
++            if not key.startswith("msg@"):
++                self.snaps[key] = snap
+             return
+         self.snaps[key] = {"ids": list(ids), "pos": self.model.pos, "half": getattr(self.model, "half", 0),
+                      "states": [{n: st.read_state(n) for n in names}
+                                 for st, names in zip(self.model.states, self.gdn_states)]}
+ 
++    # ---- pinned system prompts ----
++    def _pin_path(self):
++        return Path(self.a.pin_dir) / f"{MODEL_ID}.json"
++
++    def _pin_load(self):
++        try:
++            return [list(x) for x in json.loads(self._pin_path().read_text())][: self.a.pin_max]
++        except (OSError, ValueError):
++            return []
++
++    def _pin_record(self, ids):
++        """Most recent first, distinct, at most --pin-max; written atomically."""
++        if self.a.pin_max <= 0 or len(ids) < 256:
++            return
++        ids = list(ids)
++        # a prefix of a recorded pin, or a pin that is a prefix of this one, is the same client: keep the longer one
++        self.pins = ([ids] + [p for p in self.pins if p != ids and p[:len(ids)] != ids and ids[:len(p)] != p]
++                     )[: self.a.pin_max]
++        path = self._pin_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_suffix(".tmp")
++        tmp.write_text(json.dumps(self.pins))
++        tmp.replace(path)
++        for e in self.apc:
++            e["pinned"] = any(p == e["ids"] for p in self.pins) if len(e["ids"]) >= 256 else e.get("pinned", False)
++
++    def warm_pins(self):
++        """Prefill each recorded system prompt once and keep it in the prefix cache, pinned."""
++        if self.a.pin_max <= 0 or not self.apc_budget:
++            return
++        for ids in reversed(self._pin_load()):
++            t0 = time.perf_counter()
++            with self.lock:
++                self.model.reset()
++                if self.drafter is not None:
++                    self.drafter.reset()
++                self.fed = []
++                self._feed(ids)
++                self.fed = list(ids)
++                self._snapshot("system", ids)
++            log(f"prefix pin: warmed {len(ids)}-tok system prompt in {time.perf_counter() - t0:.1f}s")
++
++    @staticmethod
++    def _snap_bytes(snap):
++        n = sum(v.nbytes for st in snap["states"] for v in st.values())
++        n += sum(v.nbytes for d in snap.get("kv", []) for v in d.values())
++        n += sum(k.nbytes + v.nbytes for k, v in snap.get("ring", []))
++        return n
++
++    HEAVY = ("states", "kv", "ring")
++
++    def _apc_put(self, snap):
++        """Automatic prefix cache: keep the snapshot (its KV segment included). Entries form a tree of prefixes (each
++        holds the KV rows past its parent). Over the RAM budget, the least recently used entries move to the SSD tier
++        (the entry object stays, so children keep their parent link); over the SSD budget, the least recently used
++        disk entries without children are dropped."""
++        snap["bytes"], snap["used"] = self._snap_bytes(snap), time.monotonic()
++        if any(e["ids"] == snap["ids"] for e in self.apc):
++            return
++        self.apc.append(snap)
++        mem = lambda: sum(e["bytes"] for e in self.apc if "states" in e)  # noqa: E731
++        while mem() > self.apc_budget:
++            cand = [e for e in self.apc if "states" in e and e is not snap and not e.get("pinned")]
++            if not cand:  # only pinned entries left in RAM: the oldest pins move to the SSD tier (still never dropped)
++                cand = [e for e in self.apc if "states" in e and e is not snap]
++                if not cand or self.apc_disk_budget <= 0:
++                    break
++            e = min(cand, key=lambda e_: e_["used"])
++            if self.apc_disk_budget > 0:
++                self._spill(e)
++            else:
++                self._drop(e)
++        while sum(e.get("disk_bytes", 0) for e in self.apc) > self.apc_disk_budget:
++            kids = {id(e["parent"]) for e in self.apc if e.get("parent") is not None}
++            cand = [e for e in self.apc if "disk" in e and id(e) not in kids and not e.get("pinned")]
++            if not cand:
++                break
++            self._drop(min(cand, key=lambda e_: e_["used"]))
++
++    def _spill(self, e):
++        import pickle
++        path = self.apc_dir / f"{uuid.uuid4().hex}.pkl"
++        with open(path, "wb") as f:
++            pickle.dump({k: e[k] for k in self.HEAVY if k in e}, f, protocol=5)
++        for k in self.HEAVY:
++            e.pop(k, None)
++        e["disk"], e["disk_bytes"] = path, path.stat().st_size
++
++    def _drop(self, e):
++        """Remove an entry; its children (they need its KV rows) go with it."""
++        doomed, changed = {id(e)}, True
++        while changed:
++            changed = False
++            for x in self.apc:
++                if id(x) not in doomed and x.get("parent") is not None and id(x["parent"]) in doomed:
++                    doomed.add(id(x))
++                    changed = True
++        for x in [x for x in self.apc if id(x) in doomed]:
++            if "disk" in x:
++                Path(x["disk"]).unlink(missing_ok=True)
++            self.apc.remove(x)
++
++    def _materialize(self, snap):
++        """The entry and its parent chain with every heavy field present: entries on the SSD tier are read back into
++        copies (the cache entries themselves stay where they are)."""
++        import pickle
++        if snap is None:
++            return None
++        out = dict(snap)
++        if "disk" in snap:
++            with open(snap["disk"], "rb") as f:
++                out.update(pickle.load(f))
++        out["parent"] = self._materialize(snap.get("parent"))
++        return out
++
+     def _restore(self, snap):
+         if self.v2:
++            entry, t0 = snap, time.perf_counter()
++            if "used" in snap:  # a prefix cache entry: the chain may be partly on the SSD tier
++                on_ssd, e = 0, snap
++                while e is not None:
++                    on_ssd += "disk" in e
++                    e = e.get("parent")
++                snap = self._materialize(snap)
++                if on_ssd:
++                    log(f"prefix cache: {on_ssd} segment(s) of a {len(snap['ids'])}-tok prefix read from SSD in "
++                        f"{time.perf_counter() - t0:.2f}s")
+             self.model.restore(snap)
+             if self.drafter is not None:
+                 slot_pos, pending = snap["draft"]
+                 d = self.drafter
+-                # slots rewritten since the snapshot hold positions of an abandoned continuation: hide them (the
+-                # queued features of the snapshot are written again on the next flush)
+-                d.slot_pos = np.where(d.slot_pos == slot_pos, slot_pos, -1)
++                if "ring" in snap:  # the saved ring: every slot back as it was
++                    for (k, v), (k0, v0) in zip(d.ring, snap["ring"]):
++                        k[:] = k0
++                        v[:] = v0
++                    d.slot_pos = slot_pos.copy()
++                else:
++                    # slots rewritten since the snapshot hold positions of an abandoned continuation: hide them (the
++                    # queued features of the snapshot are written again on the next flush)
++                    d.slot_pos = np.where(d.slot_pos == slot_pos, slot_pos, -1)
+                 d.pending = list(pending)
++            e, now = entry, time.monotonic()
++            while e is not None:
++                if "used" in e:
++                    e["used"] = now
++                e = e.get("parent")
+         else:
+             for st, saved in zip(self.model.states, snap["states"]):
+                 for n, v in saved.items():
+                     st.write_state(n, v)
+             self.model.pos = snap["pos"]
+-            self.model.half = snap.get("half", 0)
++            self.model.half = getattr(self.model, "half", 0) if "half" not in snap else snap["half"]
+         self.fed = list(snap["ids"])
+ 
+     def _feed(self, ids, ingest=None):
+@@ -349,13 +536,15 @@ class Engine:
+             show = lambda t: self.tok.decode(t[max(0, j - 12):j + 24], skip_special_tokens=False)  # noqa: E731
+             print(f"[cache] model state {n} tok, prompt {len(ids)} tok, first difference at {j}:\n"
+                   f"   state : {show(self.fed)!r}\n   prompt: {show(ids)!r}", flush=True)
+-        best = max((s_ for s_ in self.snaps.values()
+-                    if len(ids) > len(s_["ids"]) and ids[:len(s_["ids"])] == s_["ids"]),
++        cands = list(self.snaps.values()) + self.apc
++        best = max((s_ for s_ in cands
++                    if len(ids) > len(s_["ids"]) and ids[:len(s_["ids"])] == s_["ids"]
++                    and (not self.v2 or self.model.restorable(s_))),
+                    key=lambda s_: len(s_["ids"]), default=None)
+         if n and len(ids) > n and ids[:n] == self.fed and (best is None or n >= len(best["ids"])):
+             reused, how = n, "continue (model state is a prefix of the prompt)"
+         elif best is not None:
+-            key = next(k for k, v in self.snaps.items() if v is best)
++            key = next((k for k, v in self.snaps.items() if v is best), "prefix-cache")
+             self._restore(best)
+             reused, how = len(self.fed), f"restore '{key}' snapshot"
+         else:
+@@ -371,6 +560,12 @@ class Engine:
+         cuts = []
+         if sys_cut > reused and ("system" not in self.snaps or self.snaps["system"]["ids"] != ids[:sys_cut]):
+             cuts.append((sys_cut, "system"))
++        if self.apc_budget > 0:  # every later message start up to the last header: the prefixes later prompts share
++            known = {len(e["ids"]) for e in self.apc}
++            starts = [i for i, t in enumerate(ids) if t == self.im_start][:APC_BOUNDARIES]
++            for i_ in starts:
++                if reused < i_ < turn_cut and i_ != sys_cut and i_ not in known:
++                    cuts.append((i_, f"msg@{i_}"))
+         if turn_cut > reused:
+             cuts.append((turn_cut, "turn"))
+         logits, i = None, reused
+@@ -689,6 +884,53 @@ def stream_calls(region, tools, final):
+     return calls
+ 
+ 
++def truncated_call(text, finish):
++    """A note for the client when generation stopped (token limit) inside a tool call: the call is dropped (its
++    arguments are incomplete), and the note tells the model why, so it splits the work instead of resending the same
++    oversized call."""
++    if finish != "length":
++        return ""
++    tail = text.rsplit("<tool_call>", 1)
++    if len(tail) < 2 or "</tool_call>" in tail[1]:
++        return ""
++    m = re.search(r"<function=([^>\s]+)>", tail[1])
++    name = m.group(1) if m else "a tool"
++    return (f"\n\n[server: the call to `{name}` was cut off at the max_tokens limit and was not sent. Make it "
++            f"smaller: write a large file in several parts (create it, then append or edit section by section).]")
++
++
++def repeated_failed_call(messages, max_repeats):
++    """(name, count) when the last `max_repeats` assistant turns made the identical tool call and every result
++    after them failed (non-zero exit / error text): a greedy model given the same prompt repeats it forever."""
++    if max_repeats <= 0:
++        return None
++    turns, i = [], len(messages) - 1
++    while i >= 0 and len(turns) < max_repeats:
++        m = messages[i]
++        if m.get("role") == "tool":
++            j = i
++            while j >= 0 and messages[j].get("role") == "tool":
++                j -= 1
++            if j < 0 or messages[j].get("role") != "assistant" or not messages[j].get("tool_calls"):
++                return None
++            res = " ".join(str(x.get("content") or "") for x in messages[j + 1:i + 1])
++            calls = [(c.get("function", c).get("name"), json.dumps(c.get("function", c).get("arguments"),
++                                                                      sort_keys=True))
++                     for c in messages[j]["tool_calls"]]
++            turns.append((calls, res))
++            i = j - 1
++        elif m.get("role") in ("user", "system"):
++            i -= 1
++        else:
++            return None
++    if len(turns) < max_repeats or any(t[0] != turns[0][0] for t in turns):
++        return None
++    failed = re.compile(r"exit: [1-9]|exit code [1-9]|error|failed|not found|no such file", re.I)
++    if not all(failed.search(r[:400] or "") for _, r in turns):
++        return None
++    return turns[0][0][0][0], len(turns)
++
++
+ class StreamSplitter:
+     """Incrementally route generated text into reasoning / content deltas, holding back possible partial tags
+     and everything from <tool_call> on (tool calls are sent once complete)."""
+@@ -720,7 +962,9 @@ class StreamSplitter:
+         stopper = content.find("<tool_call>")
+         if stopper >= 0:  # tool calls stream as OpenAI tool_calls deltas (name first, then argument fragments)
+             deltas = []
+-            for i, (name, args, _) in enumerate(stream_calls(content[stopper:], self.tools, final)):
++            for i, (name, args, complete) in enumerate(stream_calls(content[stopper:], self.tools, final)):
++                if not complete:  # a call cut off (token limit) must not reach the client as broken JSON
++                    break
+                 if i == len(self.calls):
+                     self.calls.append([f"call_{uuid.uuid4().hex[:12]}", name, ""])
+                     deltas.append({"index": i, "id": self.calls[i][0], "type": "function",
+@@ -747,6 +991,18 @@ class StreamSplitter:
+ CORS_PATHS = ("/health", "/v1/models", "/models")
+ 
+ 
++def prefix_cache_status(engine):
++    apc = getattr(engine, "apc", None)
++    if apc is None:
++        return None
++    return {"pinned": sorted(len(e["ids"]) for e in apc if e.get("pinned")),
++            "ram": sorted(len(e["ids"]) for e in apc if "states" in e),
++            "ssd": sorted(len(e["ids"]) for e in apc if "disk" in e),
++            "ram_mb": round(sum(e["bytes"] for e in apc if "states" in e) / 2**20, 1),
++            "ssd_mb": round(sum(e.get("disk_bytes", 0) for e in apc) / 2**20, 1),
++            "budget_mb": engine.apc_budget // 2**20, "ssd_budget_mb": engine.apc_disk_budget // 2**20}
++
++
+ def make_handler(engine):
+     cors = {o.strip() for o in (engine.a.cors_origin or "").split(",") if o.strip()}
+     class Handler(BaseHTTPRequestHandler):
+@@ -805,7 +1061,8 @@ def make_handler(engine):
+                                  "active_context_entry": getattr(engine.model, "ctx", engine.ctx),
+                                  "prefill": getattr(engine, "prefill_stats", None),
+                                  "decode": getattr(engine, "decode_stats", None),
+-                                 "decode_live": getattr(engine, "decode_live", None)})
++                                 "decode_live": getattr(engine, "decode_live", None),
++                                 "prefix_cache": prefix_cache_status(engine)})
+             else:
+                 self._json(404, {"error": {"message": "not found"}})
+ 
+@@ -831,6 +1088,16 @@ def make_handler(engine):
+             stop = [stop] if isinstance(stop, str) else (stop or [])
+             temp = req.get("temperature")
+             temp = (1.0 if thinking else 0.7) if temp is None else float(temp)
++            rep = repeated_failed_call(req.get("messages") or [], engine.a.repeat_call_guard)
++            if rep:
++                name, cnt = rep
++                req["messages"] = list(req["messages"]) + [{"role": "user", "content": (
++                    f"<system-reminder>The same `{name}` call failed {cnt} times in a row with identical arguments. "
++                    f"Running it again gives the same result. A non-zero exit can be the expected answer (for "
++                    f"example grep exits 1 when nothing matches). Use that result, or change the approach, or "
++                    f"stop and report.</system-reminder>")}]
++                temp = max(temp, 0.7)
++                log(f"repeat guard: {cnt}x identical failing `{name}` call; note added, temperature {temp}")
+             top_p = req.get("top_p")
+             top_p = (0.95 if thinking else 0.8) if top_p is None else float(top_p)
+             top_k = int(req.get("top_k") or 20)
+@@ -888,7 +1155,10 @@ def make_handler(engine):
+                         tail = splitter.feed("", final=True)
+                         if tail:
+                             emit(tail)
+-                        if splitter.calls:  # streamed incrementally above
++                        cut = truncated_call(text, finish)
++                        if cut:
++                            emit({"content": cut})
++                        if splitter.calls and not cut:  # streamed incrementally above
+                             finish = "tool_calls"
+                         else:
+                             _, _, calls = split_output(text, thinking)
+@@ -910,6 +1180,9 @@ def make_handler(engine):
+                     text, finish, n, reused, dt = engine.generate(ids, max_tokens, temp, top_p, top_k, stop,
+                                                                   req.get("seed"), lambda d: None, presence, dry, budget)
+                     reasoning, content, calls = split_output(text, thinking)
++                    cut = truncated_call(text, finish)
++                    if cut:
++                        content = (content or "") + cut
+                     msg = {"role": "assistant", "content": content or (None if calls else "")}
+                     if reasoning:
+                         msg["reasoning_content"] = reasoning
+@@ -917,7 +1190,8 @@ def make_handler(engine):
+                         msg["tool_calls"] = [{"id": f"call_{uuid.uuid4().hex[:12]}", "type": "function",
+                                               "function": {"name": fn, "arguments": json.dumps(typed_args(fn, p, tools))}}
+                                              for fn, p in calls]
+-                        finish = "tool_calls"
++                        if not cut:
++                            finish = "tool_calls"
+                     self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": MODEL_ID,
+                                      "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+                                      "usage": {"prompt_tokens": len(ids), "completion_tokens": n,
+@@ -971,6 +1245,7 @@ def main():
+     a = parse()
+     startup_banner(a)
+     engine = Engine(a)
++    engine.warm_pins()
+     server = ThreadingHTTPServer((a.host, a.port), make_handler(engine))
+     print(f"[{MODEL_ID}] serving OpenAI API on http://{a.host}:{a.port}/v1 "
+           f"({'speculative ON' if a.draft else 'speculative OFF'}, ctx {a.ctx})", flush=True)
+diff --git a/tests/test_drafter_release.py b/tests/test_drafter_release.py
+index 0cc7dc31bada3014ceca33681f858ed2b1ef4526..bc52dc46aa795428529b365b54afcf0119fed8a0 100644
+--- a/tests/test_drafter_release.py
++++ b/tests/test_drafter_release.py
+@@ -102,6 +102,23 @@ class DrafterReleaseTests(unittest.TestCase):
+         with self.assertRaisesRegex(ValueError, "taps"):
+             self.manifest()
+ 
++    def test_foreign_drafter_opt_in_allows_other_export_only(self):
++        """FORGE_FOREIGN_DRAFTER=1 (a drafter with its own head on another target, e.g. Bonsai 2): the export-name
++        check is skipped; the taps / T / shape checks still apply."""
++        import os
++        from unittest.mock import patch
++        self.meta["target_export"] = "other_target"
++        self.meta["head_export"] = "other_target/lm_head.safetensors"
++        self.write_metadata()
++        with self.assertRaisesRegex(ValueError, "export mismatch"):
++            self.manifest()
++        with patch.dict(os.environ, {"FORGE_FOREIGN_DRAFTER": "1"}):
++            self.manifest()
++            self.cfg["dflash_config"]["target_layer_ids"] = [5, 19, 33, 47, 60]
++            self.write_metadata()
++            with self.assertRaisesRegex(ValueError, "taps"):
++                self.manifest()
++
+     def test_selector_rejects_wrong_shape_or_full_checkpoint(self):
+         for kw in ({"shape": [2, 256]}, {"extra": True}):
+             self.selector(**kw)

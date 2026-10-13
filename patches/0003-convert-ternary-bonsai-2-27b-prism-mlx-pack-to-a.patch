@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cowboy Coder <howdy@cowboycoderhq.com>
+Date: Tue, 13 Oct 2026 02:42:05 +0000
+Subject: [PATCH] Convert Ternary Bonsai 2 27B (Prism MLX pack) to a Forge
+ export
+
+Ternary codes become a 2-bit LUT {-1, 0, +1} with one least-squares scale per
+output row; Prism's Hadamard signs are kept (MODEL/bonsai_signs.npz) and
+lm_head may carry rot_seed. WikiText-2 ppl: pack 6.843, per-row export 6.845
+(MLX), ANE build 6.860.
+---
+ coreai/qwen38_coreai_build.py | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/coreai/qwen38_coreai_build.py b/coreai/qwen38_coreai_build.py
+index 6c3a608d6c33f18b79fd6c4b170cd54e0aeee6ee..af1d8501c41507e043a01d787dfabe0376cd5863 100644
+--- a/coreai/qwen38_coreai_build.py
++++ b/coreai/qwen38_coreai_build.py
+@@ -242,6 +242,20 @@ class QConv(nn.Module):
+         return y if self.lr_a is None else y + self.lr_a(self.lr_b(x))
+ 
+ 
++def explicit_signs(seed, n):
++    """Sign vector stored with the checkpoint for this seed (Bonsai packs: MODEL/bonsai_signs.npz), else None."""
++    path = M.MODEL / "bonsai_signs.npz"
++    if not path.exists():
++        return None
++    z = np.load(path)
++    if str(seed) not in z.files:
++        return None
++    v = z[str(seed)].astype(np.float64)
++    if v.shape != (n,):
++        raise ValueError(f"explicit signs for seed {seed}: shape {v.shape}, expected ({n},)")
++    return v
++
++
+ class Hadamard(nn.Module):
+     """x (1, n, 1, T) -> x M, M = blockdiag(diag(signs) H_1024) / 32 (the export's online rotation, same seeds)."""
+ 
+@@ -249,7 +263,9 @@ class Hadamard(nn.Module):
+         super().__init__()
+         from scipy.linalg import hadamard
+         h = hadamard(block)
+-        signs = np.random.default_rng(seed).choice([-1.0, 1.0], n)
++        signs = explicit_signs(seed, n)
++        if signs is None:
++            signs = np.random.default_rng(seed).choice([-1.0, 1.0], n)
+         wt = np.concatenate([(signs[b * block:(b + 1) * block, None] * h).T for b in range(n // block)])
+         self.conv = nn.Conv2d(n, n, 1, groups=n // block, bias=False)
+         self.conv.weight = nn.Parameter(torch.from_numpy((wt / np.sqrt(block)).astype(np.float16)).view(n, block, 1, 1),
+@@ -902,9 +918,15 @@ class Head(nn.Module):
+                 W["h/scale"] = np.asarray(s, np.float16).reshape(-1)[a:b]
+             mods.append(QConv(W, "h"))
+         self.parts = nn.ModuleList(mods)
++        from safetensors import safe_open
++        with safe_open(str(M.EXPORT_DIR / "lm_head.safetensors"), framework="pt") as f:
++            rs = (f.metadata() or {}).get("rot_seed")
++        self.rot = Hadamard(CFG["hidden_size"], int(rs)) if rs is not None else None
+ 
+     def forward(self, x):
+         h = rms_hidden(x, self.normw)
++        if self.rot is not None:
++            h = self.rot(h)
+         return torch.cat([p(h).reshape(-1, self.T).transpose(0, 1) for p in self.parts], 1)
+ 
+ 

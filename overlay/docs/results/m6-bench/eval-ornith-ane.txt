@@ -1,0 +1,9 @@
+ornith-ane (forge-ornith15d) nothink lru_cache: PASS 177 tok 7.5s
+ornith-ane (forge-ornith15d) nothink parse_duration: FAIL 329 tok 13.2s ValueError: unknown unit: '1'
+ornith-ane (forge-ornith15d) nothink fix_bug_merge: PASS 262 tok 10.5s
+ornith-ane (forge-ornith15d) nothink topo_sort: PASS 309 tok 12.3s
+ornith-ane (forge-ornith15d) nothink csv_quotes: PASS 232 tok 9.3s
+ornith-ane (forge-ornith15d) nothink rate_limiter: PASS 394 tok 15.7s
+ornith-ane (forge-ornith15d) nothink roman: FAIL 832 tok 32.5s SyntaxError: invalid syntax
+ornith-ane (forge-ornith15d) nothink fix_bug_binsearch: PASS 262 tok 10.8s
+TOTAL 6 / 8

@@ -1,0 +1,22 @@
+Ternary-Bonsai-2-27B-16GB-M6-ANE
+Copyright 2026 Cowboy Coder
+
+This repository contains scripts, new files and patches for ANEMLL Forge (https://github.com/Anemll/anemll-forge),
+Copyright (c) 2026 ANEMLL contributors, MIT License. The patches in patches/ modify ANEMLL Forge at commit 6c572a8; its
+license is in LICENSE.anemll-forge. Forge itself is downloaded by scripts/prepare.sh and is not included here. This
+repository's own content is MIT, Copyright (c) 2026 Cowboy Coder (see LICENSE).
+
+This project is independent. It is not affiliated with or endorsed by ANEMLL, Prism ML, Ornith, z-lab, ProCreations,
+the Qwen Team / Alibaba Cloud or Apple.
+
+Model files published with this project (on Hugging Face, not in this repository):
+
+- Ternary Bonsai 2 27B, Core AI build. Derived from prism-ml/Ternary-Bonsai-2-27B-mlx-2bit, Copyright 2026-present
+  Prism ML, Inc., Apache License 2.0, which is built from Qwen3.8-27B, Copyright 2026 Alibaba Cloud, Apache License 2.0.
+  Created using Bonsai by Prism ML.
+- DFlash2 drafter. Copied from anemll/anemll-forge-qwen3.8-27B (drafter/), derived from
+  ProCreations/Ternary-Bonsai-2-27B-DFlash2 (z-lab/Qwen3.8-27B-DFlash2 and Prism Ternary-Bonsai-2-27B), Apache License
+  2.0. Its upstream LICENSE and NOTICE are included unchanged.
+- Ornith-1.5-9B, 4-bit Core AI build. Derived from ornith-ai/Ornith-1.5-9B, MIT License.
+
+Each model folder carries the upstream license and notice files and a MODIFICATIONS.md that lists the changes.

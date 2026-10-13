@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cowboy Coder <howdy@cowboycoderhq.com>
+Date: Tue, 13 Oct 2026 02:42:05 +0000
+Subject: [PATCH] Derive the chunk plan from num_hidden_layers; TAPS from the
+ environment
+
+forge.py accepted only the 64-layer / 5120-hidden checkpoint. Accept any qwen3_5
+text config with a layer count divisible by 4 and full_attention_interval 4, and
+build the 4-layer chunk plan from num_hidden_layers. TAPS (drafter feature
+layers) can be set from the environment; empty builds a target without taps.
+---
+ coreai/qwen38_coreai_build.py |  2 +-
+ forge.py                      |  7 ++++---
+ scripts/qwen38_ane_model.py   |  3 ++-
+ tests/test_launcher.py        | 13 ++++++++++++-
+ 4 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/coreai/qwen38_coreai_build.py b/coreai/qwen38_coreai_build.py
+index f8d6253eb46e6219ca6b161bc2e1d6691cda87b4..e10459fab16fd253e79d9fc6e339dddcfba16f97 100644
+--- a/coreai/qwen38_coreai_build.py
++++ b/coreai/qwen38_coreai_build.py
+@@ -1094,7 +1094,7 @@ def main():
+     ap.add_argument("layers", nargs="?", default="0-3")
+     ap.add_argument("--ctx", default="2048,8192,16384")
+     ap.add_argument("--pctx", default="2048")
+-    ap.add_argument("--plan", default=",".join(f"{i}-{i + 3}" for i in range(0, 64, 4)))
++    ap.add_argument("--plan", default=",".join(f"{i}-{i + 3}" for i in range(0, M.cfg()["num_hidden_layers"], 4)))
+     ap.add_argument("--name", default=None)
+     ap.add_argument("--kv-cache-dtype", choices=("fp16", "v8", "kv8", "both"), default=KV_CACHE_DTYPE)
+     ap.add_argument("--kv-cache-default", choices=("fp16", "v8"), default="v8",
+diff --git a/forge.py b/forge.py
+index a4569eec026e8ff12ad4333aa7beeec552589508..7d1f57a2acb914870cd8e21915a413a30e0b7f8c 100644
+--- a/forge.py
++++ b/forge.py
+@@ -78,8 +78,9 @@ def prepare(a):
+     if not (a.model / "config.json").is_file():
+         raise ValueError(f"Missing checkpoint config: {a.model / 'config.json'}")
+     cfg = json.loads((a.model / "config.json").read_text()).get("text_config", {})
+-    if cfg.get("num_hidden_layers") != 64 or cfg.get("hidden_size") != 5120:
+-        raise ValueError("This initial port expects the research checkpoint: 64 layers, hidden_size 5120.")
++    nl = cfg.get("num_hidden_layers")
++    if not isinstance(nl, int) or nl % 4 or cfg.get("full_attention_interval", 4) != 4:
++        raise ValueError("Expected a qwen3_5 text config with a layer count divisible by 4 and full_attention_interval 4.")
+     env = {"MODEL": str(a.model), **NUMERICS}
+     # A cache belongs to its checkpoint, never to an unrelated model in ~/Models.
+     published_embedding = a.model / "embed_tokens_fp16.npy"
+@@ -111,7 +112,7 @@ def prepare(a):
+         if dest.exists():
+             raise ValueError(f"Build destination already exists; choose a new --output: {dest}")
+         env.update(EXPORT_DIR=str(a.export), ANE_OUT=str(a.output), CTX=str(a.ctx),
+-                   CHUNK_PLAN=",".join(f"{i}-{i+3}" for i in range(0, 64, 4)))
++                   CHUNK_PLAN=",".join(f"{i}-{i+3}" for i in range(0, nl, 4)))
+         script, args = "qwen38_ane_model.py", ["build_v3"]
+     else:
+         if a.ctx <= 0:
+diff --git a/scripts/qwen38_ane_model.py b/scripts/qwen38_ane_model.py
+index 714e308f76e0c15b7bb418db1e3f554ac6cefc5a..a991afe98ad1b43fb6c849c5243d1bcffe9a282e 100644
+--- a/scripts/qwen38_ane_model.py
++++ b/scripts/qwen38_ane_model.py
+@@ -44,7 +44,8 @@ V3_KV_IN = os.environ.get("V3_KV_IN", "1") == "1"    # v3 -> "v4": KV caches as
+ V3_PREFILL = int(os.environ.get("V3_PREFILL", "0"))  # >0: second function "prefill" with this many rows (-> "v5")
+ V3_TAG = "v5" if V3_PREFILL else ("v4" if V3_KV_IN else "v3")
+ PREFILL_T = int(os.environ.get("PREFILL_T", "16"))  # v2: tokens per prefill call (T=32 fails to compile at 12 layers)
+-TAPS = [5, 19, 33, 47, 61]                          # v2: hidden states after these layers (DFlash2 drafter features)
++TAPS = ([int(x) for x in os.environ["TAPS"].split(",") if x] if "TAPS" in os.environ
++        else [5, 19, 33, 47, 61])                   # v2: hidden states after these layers (DFlash2 drafter features)
+ STEP_MAX = 3                                        # v2: prompt remainders up to this many tokens use decode steps
+ PREFILL_SPLIT = int(os.environ.get("PREFILL_SPLIT", "64"))  # v2: layers per prefill function (default: the whole chunk)
+ KV_IO = os.environ.get("KV_IO", "0") == "1"                # v2: KV caches as I/O (slower decode) instead of MLState
+diff --git a/tests/test_launcher.py b/tests/test_launcher.py
+index 50acad5879dc3fc8f7fcd434ebcef0b0f0cae803..eca9ade18c9b4846efea2c1fe6c4d46151654c19 100644
+--- a/tests/test_launcher.py
++++ b/tests/test_launcher.py
+@@ -46,8 +46,19 @@ class LauncherTests(unittest.TestCase):
+ 
+     def test_model_shape_rejected(self):
+         (self.model / "config.json").write_text('{"text_config": {"hidden_size": 1024}}')
+-        with self.assertRaisesRegex(ValueError, "64 layers"):
++        with self.assertRaisesRegex(ValueError, "layer count divisible by 4"):
+             forge.prepare(self.args("convert", "--export", str(self.root), "--output", str(self.root / "out")))
++        (self.model / "config.json").write_text('{"text_config": {"hidden_size": 4096, "num_hidden_layers": 30}}')
++        with self.assertRaisesRegex(ValueError, "layer count divisible by 4"):
++            forge.prepare(self.args("convert", "--export", str(self.root), "--output", str(self.root / "out")))
++
++    def test_chunk_plan_follows_layer_count(self):
++        (self.model / "config.json").write_text(json.dumps({"text_config": {
++            "hidden_size": 4096, "num_hidden_layers": 32, "full_attention_interval": 4}}))
++        export = self.root / "export9b"
++        export.mkdir()
++        _, env = forge.prepare(self.args("convert", "--export", str(export), "--output", str(self.root / "b9")))
++        self.assertEqual(env["CHUNK_PLAN"].split(","), [f"{i}-{i + 3}" for i in range(0, 32, 4)])
+ 
+     def test_server_uses_loopback_and_checkpoint_specific_cache(self):
+         build = self.root / "build"

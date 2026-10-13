@@ -1,0 +1,22 @@
+== bonsai: GPU=bonsai-gpu  ANE=bonsai-ane-draft  power source: macmon (sys_power = whole-machine SMC power; cpu/gpu/ane = IOReport rails)
+  prompt  512  prefill_tps         GPU   67.7152  ANE  287.3021  ratio   4.24  PASS
+  prompt  512  decode_tps          GPU   17.5458  ANE   39.7170  ratio   2.26  PASS
+  prompt  512  J_per_prompt_token  GPU    0.3241  ANE    0.0404  ratio   0.12  PASS
+  prompt  512  J_per_gen_token     GPU    1.9224  ANE    0.3898  ratio   0.20  PASS
+  prompt 2048  prefill_tps         GPU   70.8413  ANE  313.8593  ratio   4.43  PASS
+  prompt 2048  decode_tps          GPU   17.3804  ANE   33.0917  ratio   1.90  PASS
+  prompt 2048  J_per_prompt_token  GPU    0.3465  ANE    0.0538  ratio   0.16  PASS
+  prompt 2048  J_per_gen_token     GPU    2.0012  ANE    0.4931  ratio   0.25  PASS
+  drafter accept % per run: [43.3, 33.3, 38.0, 26.8, 29.9, 29.6]  tokens/verify: [4.0, 3.28, 3.66, 2.88, 3.08, 3.05]
+  ANE placement: ['fully_ane']  health: {'soc_class': 'm6', 'ane_bonded_compile_mode': 2}
+== ornith: GPU=ornith-gpu  ANE=ornith-ane  power source: macmon (sys_power = whole-machine SMC power; cpu/gpu/ane = IOReport rails)
+  prompt  512  prefill_tps         GPU  267.6105  ANE  846.3185  ratio   3.16  PASS
+  prompt  512  decode_tps          GPU   24.0587  ANE   25.8342  ratio   1.07  PASS
+  prompt  512  J_per_prompt_token  GPU    0.0634  ANE    0.0145  ratio   0.23  PASS
+  prompt  512  J_per_gen_token     GPU    0.9408  ANE    0.5695  ratio   0.61  PASS
+  prompt 2048  prefill_tps         GPU  283.5695  ANE  938.9604  ratio   3.31  PASS
+  prompt 2048  decode_tps          GPU   23.8041  ANE   25.9486  ratio   1.09  PASS
+  prompt 2048  J_per_prompt_token  GPU    0.0853  ANE    0.0150  ratio   0.18  PASS
+  prompt 2048  J_per_gen_token     GPU    0.9892  ANE    0.6512  ratio   0.66  PASS
+  ANE placement: ['fully_ane']  health: {'soc_class': 'm6', 'ane_bonded_compile_mode': 2}
+ALL SPEED+ENERGY CRITERIA: PASS

@@ -1,0 +1,6 @@
+{"layer": 5, "rel_l2": 0.0094, "cos": 0.99998}
+{"layer": 19, "rel_l2": 0.0099, "cos": 0.99996}
+{"layer": 33, "rel_l2": 0.0114, "cos": 0.99994}
+{"layer": 47, "rel_l2": 0.0107, "cos": 0.99995}
+{"layer": 61, "rel_l2": 0.0121, "cos": 0.99993}
+{"logits_top1_agree": 1.0, "tokens": 64}
